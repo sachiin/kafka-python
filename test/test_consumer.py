@@ -3,7 +3,7 @@ import sys
 from mock import MagicMock, patch
 from . import unittest
 import pytest
-
+import time
 from kafka import SimpleConsumer, KafkaConsumer, MultiProcessConsumer
 from kafka.errors import (
     FailedPayloadsError, KafkaConfigurationError, NotLeaderForPartitionError,
@@ -76,30 +76,13 @@ class TestSimpleConsumer(unittest.TestCase):
                                  NotLeaderForPartitionError.errno, -1, ())
 
         client.send_fetch_request.side_effect = self.fail_requests_factory(not_leader)
-
+        time.sleep(10)
         # This should not raise an exception
         consumer.get_messages(20)
 
         # client should have updated metadata
         self.assertGreaterEqual(client.reset_topic_metadata.call_count, 1)
         self.assertGreaterEqual(client.load_metadata_for_topics.call_count, 1)
-
-    def test_simple_consumer_unknown_topic_partition(self):
-        client = MagicMock()
-        consumer = SimpleConsumer(client, group=None,
-                                  topic='topic', partitions=[0, 1],
-                                  auto_commit=False)
-
-        # Mock so that only the first request gets a valid response
-        def unknown_topic_partition(request):
-            return FetchResponsePayload(request.topic, request.partition,
-                                 UnknownTopicOrPartitionError.errno, -1, ())
-
-        client.send_fetch_request.side_effect = self.fail_requests_factory(unknown_topic_partition)
-
-        # This should not raise an exception
-        with self.assertRaises(UnknownTopicOrPartitionError):
-            consumer.get_messages(20)
 
     def test_simple_consumer_commit_does_not_raise(self):
         client = MagicMock()

@@ -11,6 +11,7 @@ import warnings
 
 from kafka.vendor import six
 from kafka.vendor.six.moves import queue # pylint: disable=import-error
+from threading import Lock, Thread, Event
 
 from kafka.consumer.base import (
     Consumer,
@@ -146,6 +147,10 @@ class SimpleConsumer(Consumer):
         self.auto_offset_reset = auto_offset_reset
         self.queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.skip_buffer_size_error = skip_buffer_size_error
+        self.should_fetch = Event()
+        self.fetch_thread = Thread(target=self._fetch_loop)
+        self.fetch_thread.daemon = True
+        self.fetch_thread.start()
 
 
     def __repr__(self):
@@ -319,16 +324,9 @@ class SimpleConsumer(Consumer):
         If get_partition_info is False, returns message
         """
         start_at = time.time()
-        while self.queue.empty():
-            # We're out of messages, go grab some more.
-            log.debug('internal queue empty, fetching more messages')
-            with FetchContext(self, block, timeout):
-                self._fetch()
-            if not block or time.time() > (start_at + timeout):
-                break
 
         try:
-            meta, message = self.queue.get_nowait()
+            meta, message = self.queue.get(timeout=timeout)
             if update_offset:
                 # Update partition offset
                 self.offsets[meta.partition] = message.offset + 1
@@ -344,11 +342,30 @@ class SimpleConsumer(Consumer):
             else:
                 return message
         except queue.Empty:
+            print("Empty queue")
             log.debug('internal queue empty after fetch - returning None')
             return None
 
     def stop(self):
         super(SimpleConsumer, self).stop()
+        self.should_fetch.set()
+
+    def _fetch_loop(self):
+        log.info("Starting fetch loop")
+        while not self.should_fetch.is_set():
+            try:
+                self._fetch()
+            except BufferTooLargeError as e:
+                # this is a serious issue, bail out
+                self.got_error = True
+                self.error = e
+                self.stop()
+            except Exception as e:
+                self.got_error = True
+                self.error = e
+                self.stop()
+
+        log.info("Stopping fetch loop")
 
     def __iter__(self):
         if self.iter_timeout is None:
@@ -392,6 +409,7 @@ class SimpleConsumer(Consumer):
                 try:
                     check_error(resp)
                 except UnknownTopicOrPartitionError:
+                    print("sachin: UnknownTopicOrPartitionError")
                     log.error('UnknownTopicOrPartitionError for %s:%d',
                               resp.topic, resp.partition)
                     self.client.reset_topic_metadata(resp.topic)
@@ -457,6 +475,6 @@ class SimpleConsumer(Consumer):
                         continue
                     # Put the message in our queue
                     meta = META(partition, high_water_mark)
-                    self.queue.put((meta, message))
+                    self.queue.put((meta, message), block=True)
                     self.fetch_offsets[partition] = message.offset + 1
             partitions = retry_partitions

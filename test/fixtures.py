@@ -346,7 +346,7 @@ class KafkaFixture(Fixture):
         env = self.kafka_run_class_env()
 
         timeout = 5
-        max_timeout = 120
+        max_timeout = 250
         backoff = 1
         end_at = time.time() + max_timeout
         tries = 1
