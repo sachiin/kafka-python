@@ -29,6 +29,7 @@ FULL_QUEUE_WAIT_TIME_SECONDS = 0.1
 
 MAX_BACKOFF_SECONDS = 60
 
+
 class Consumer(object):
     """
     Base class to be used by other consumers. Not to be used directly
@@ -76,6 +77,7 @@ class Consumer(object):
         if self.group is not None:
             self.fetch_last_known_offsets(partitions)
         else:
+            # no concurrent modification case
             for partition in partitions:
                 self.offsets[partition] = 0
 
@@ -110,6 +112,7 @@ class Consumer(object):
             fail_on_error=False
         )
 
+        offsets = self.offsets.copy()
         for resp in responses:
             try:
                 check_error(resp)
@@ -120,12 +123,18 @@ class Consumer(object):
 
             # -1 offset signals no commit is currently stored
             if resp.offset == -1:
-                self.offsets[resp.partition] = 0
+                offsets[resp.partition] = 0
 
             # Otherwise we committed the stored offset
             # and need to fetch the next one
             else:
-                self.offsets[resp.partition] = resp.offset
+                offsets[resp.partition] = resp.offset
+
+        # avoid concurrent modfication
+        if self.offsets is not offsets:
+            log.warning("concurrent modification detected in fetch_last_known_offsets!")
+        self.offsets = offsets
+
 
     def commit(self, partitions=None):
         """Commit stored offsets to Kafka via OffsetCommitRequest (v0)

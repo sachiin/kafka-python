@@ -6,6 +6,7 @@ except ImportError:
     from itertools import izip_longest as izip_longest, repeat  # pylint: disable=E0611
 import logging
 import sys
+from threading import Lock
 import time
 import warnings
 
@@ -37,36 +38,6 @@ from collections import namedtuple
 log = logging.getLogger(__name__)
 MAX_QUEUE_SIZE = 10 * 1024
 META = namedtuple("meta", ["partition", "high_water_mark"])
-
-class FetchContext(object):
-    """
-    Class for managing the state of a consumer during fetch
-    """
-    def __init__(self, consumer, block, timeout):
-        warnings.warn('deprecated - this class will be removed in a future'
-                      ' release', DeprecationWarning)
-        self.consumer = consumer
-        self.block = block
-
-        if block:
-            if not timeout:
-                timeout = FETCH_DEFAULT_BLOCK_TIMEOUT
-            self.timeout = timeout * 1000
-
-    def __enter__(self):
-        """Set fetch values based on blocking status"""
-        self.orig_fetch_max_wait_time = self.consumer.fetch_max_wait_time
-        self.orig_fetch_min_bytes = self.consumer.fetch_min_bytes
-        if self.block:
-            self.consumer.fetch_max_wait_time = self.timeout
-            self.consumer.fetch_min_bytes = 1
-        else:
-            self.consumer.fetch_min_bytes = 0
-
-    def __exit__(self, type, value, traceback):
-        """Reset values"""
-        self.consumer.fetch_max_wait_time = self.orig_fetch_max_wait_time
-        self.consumer.fetch_min_bytes = self.orig_fetch_min_bytes
 
 
 class SimpleConsumer(Consumer):
@@ -147,11 +118,12 @@ class SimpleConsumer(Consumer):
         self.auto_offset_reset = auto_offset_reset
         self.queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.skip_buffer_size_error = skip_buffer_size_error
-        self.should_fetch = Event()
+        self.stop_fetch = Event()
         self.fetch_thread = Thread(target=self._fetch_loop)
         self.fetch_thread.daemon = True
         self.fetch_thread.start()
-
+        self.offset_lock = Lock() # avoid concurrent modifications
+        self.got_error = False
 
     def __repr__(self):
         return '<SimpleConsumer group=%s, topic=%s, partitions=%s>' % \
@@ -165,6 +137,12 @@ class SimpleConsumer(Consumer):
 
         Returns: Updated offset on success, None on failure
         """
+        # pass as references to avoid concurrent modification issues
+        with self.offset_lock:
+            o, f = self.offsets, self.fetch_offsets
+        return self._reset_partition_offset(partition, o, f)
+
+    def _reset_partition_offset(self, partition, offsets, fetch_offsets):
         LATEST = -1
         EARLIEST = -2
         if self.auto_offset_reset == 'largest':
@@ -192,8 +170,8 @@ class SimpleConsumer(Consumer):
             log.error('%s sending offset request for %s:%d',
                       e.__class__.__name__, self.topic, partition)
         else:
-            self.offsets[partition] = resp.offsets[0]
-            self.fetch_offsets[partition] = resp.offsets[0]
+            offsets[partition] = resp.offsets[0]
+            fetch_offsets[partition] = resp.offsets[0]
             return resp.offsets[0]
 
     def seek(self, offset, whence=None, partition=None):
@@ -212,32 +190,32 @@ class SimpleConsumer(Consumer):
             partition: modify which partition, default is None.
                 If partition is None, would modify all partitions.
         """
-
+        offsets = self.offsets
         if whence is None: # set an absolute offset
             if partition is None:
-                for tmp_partition in self.offsets:
-                    self.offsets[tmp_partition] = offset
+                for tmp_partition in offsets:
+                    offsets[tmp_partition] = offset
             else:
-                self.offsets[partition] = offset
+                offsets[partition] = offset
         elif whence == 1:  # relative to current position
             if partition is None:
-                for tmp_partition, _offset in self.offsets.items():
-                    self.offsets[tmp_partition] = _offset + offset
+                for tmp_partition, _offset in offsets.items():
+                    offsets[tmp_partition] = _offset + offset
             else:
-                self.offsets[partition] += offset
+                offsets[partition] += offset
         elif whence in (0, 2):  # relative to beginning or end
             reqs = []
             deltas = {}
             if partition is None:
                 # divide the request offset by number of partitions,
                 # distribute the remained evenly
-                (delta, rem) = divmod(offset, len(self.offsets))
-                for tmp_partition, r in izip_longest(self.offsets.keys(),
+                (delta, rem) = divmod(offset, len(offsets))
+                for tmp_partition, r in izip_longest(offsets.keys(),
                                                      repeat(1, rem),
                                                      fillvalue=0):
                     deltas[tmp_partition] = delta + r
 
-                for tmp_partition in self.offsets.keys():
+                for tmp_partition in offsets.keys():
                     if whence == 0:
                         reqs.append(OffsetRequestPayload(self.topic, tmp_partition, -2, 1))
                     elif whence == 2:
@@ -255,18 +233,19 @@ class SimpleConsumer(Consumer):
 
             resps = self.client.send_offset_request(reqs)
             for resp in resps:
-                self.offsets[resp.partition] = \
+                offsets[resp.partition] = \
                     resp.offsets[0] + deltas[resp.partition]
         else:
             raise ValueError('Unexpected value for `whence`, %d' % (whence,))
 
         # Reset queue and fetch offsets since they are invalid
-        self.fetch_offsets = self.offsets.copy()
-        self.count_since_commit += 1
-        if self.auto_commit:
-            self.commit()
-
-        self.queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        with self.offset_lock:
+            self.offsets = offsets
+            self.fetch_offsets = offsets.copy()
+            self.count_since_commit += 1
+            self.queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+            if self.auto_commit:
+                self.commit()
 
     def get_messages(self, count=1, block=True, timeout=0.1):
         """
@@ -285,13 +264,15 @@ class SimpleConsumer(Consumer):
         if timeout is not None:
             timeout += time.time()
 
+        offsets = self.offsets
+
         new_offsets = {}
         log.debug('getting %d messages', count)
         while len(messages) < count:
             block_time = timeout - time.time()
             log.debug('calling _get_message block=%s timeout=%s', block, block_time)
             block_next_call = block is True or block > len(messages)
-            result = self._get_message(block_next_call, block_time,
+            result = self._get_message(offsets, block_next_call, block_time,
                                        get_partition_info=True,
                                        update_offset=False)
             log.debug('got %s from _get_messages', result)
@@ -306,16 +287,20 @@ class SimpleConsumer(Consumer):
             new_offsets[meta.partition] = message.offset + 1
 
         # Update and commit offsets if necessary
-        self.offsets.update(new_offsets)
+        offsets.update(new_offsets)
+        if offsets is not self.offsets:
+            # detect concurrent modification
+            log.warning("current modification detected by get_messages; returning empty list!")
+            return []
         self.count_since_commit += len(messages)
         self._auto_commit()
         log.debug('got %d messages: %s', len(messages), messages)
         return messages
 
     def get_message(self, block=True, timeout=0.1, get_partition_info=None):
-        return self._get_message(block, timeout, get_partition_info)
+        return self._get_message(self.offsets, block, timeout, get_partition_info)
 
-    def _get_message(self, block=True, timeout=0.1, get_partition_info=None,
+    def _get_message(self, offsets, block=True, timeout=0.1, get_partition_info=None,
                      update_offset=True):
         """
         If no messages can be fetched, returns None.
@@ -323,13 +308,15 @@ class SimpleConsumer(Consumer):
         If get_partition_info is True, returns (partition, message)
         If get_partition_info is False, returns message
         """
+        if self.got_error:
+            raise self.error
         start_at = time.time()
 
         try:
-            meta, message = self.queue.get(timeout=timeout)
+            meta, message = self.queue.get(timeout=timeout, block=block)
             if update_offset:
                 # Update partition offset
-                self.offsets[meta.partition] = message.offset + 1
+                offsets[meta.partition] = message.offset + 1
 
                 # Count, check and commit messages if necessary
                 self.count_since_commit += 1
@@ -342,19 +329,28 @@ class SimpleConsumer(Consumer):
             else:
                 return message
         except queue.Empty:
-            print("Empty queue")
             log.debug('internal queue empty after fetch - returning None')
+            if self.got_error:
+                # if the queue is empty and the background thread is stopped
+                # we are possibly in trouble, unless the application checks
+                # the state of the worker. Otherwise, we're listening to a
+                # dead channel.
+                TODO # figure out what the correct behavior is.
             return None
 
     def stop(self):
+        log.info("stopping consumer")
+        self.stop_fetch.set()
         super(SimpleConsumer, self).stop()
-        self.should_fetch.set()
 
     def _fetch_loop(self):
-        log.info("Starting fetch loop")
-        while not self.should_fetch.is_set():
+        log.info("starting fetch loop for %s", self.topic)
+        while not self.stop_fetch.is_set():
             try:
-                self._fetch()
+                # pass references to ensure we aren't subject to concurrent modification issues.
+                with self.offset_lock:
+                    q, o, f = self.queue, self.offsets, self.fetch_offsets
+                self._fetch(q, o, f)
             except BufferTooLargeError as e:
                 # this is a serious issue, bail out
                 self.got_error = True
@@ -365,7 +361,7 @@ class SimpleConsumer(Consumer):
                 self.error = e
                 self.stop()
 
-        log.info("Stopping fetch loop")
+        log.info("Exiting fetch loop")
 
     def __iter__(self):
         if self.iter_timeout is None:
@@ -385,15 +381,15 @@ class SimpleConsumer(Consumer):
                 # Timed out waiting for a message
                 break
 
-    def _fetch(self):
+    def _fetch(self, queue, fetch_offsets):
         # Create fetch request payloads for all the partitions
         partitions = dict((p, self.buffer_size)
-                      for p in self.fetch_offsets.keys())
+                      for p in fetch_offsets.keys())
         while partitions:
             requests = []
             for partition, buffer_size in six.iteritems(partitions):
                 requests.append(FetchRequestPayload(self.topic, partition,
-                                                    self.fetch_offsets[partition],
+                                                    fetch_offsets[partition],
                                                     buffer_size))
             # Send request
             responses = self.client.send_fetch_request(
@@ -409,7 +405,6 @@ class SimpleConsumer(Consumer):
                 try:
                     check_error(resp)
                 except UnknownTopicOrPartitionError:
-                    print("sachin: UnknownTopicOrPartitionError")
                     log.error('UnknownTopicOrPartitionError for %s:%d',
                               resp.topic, resp.partition)
                     self.client.reset_topic_metadata(resp.topic)
@@ -423,7 +418,8 @@ class SimpleConsumer(Consumer):
                     log.warning('OffsetOutOfRangeError for %s:%d. '
                                 'Resetting partition offset...',
                                 resp.topic, resp.partition)
-                    self.reset_partition_offset(resp.partition)
+                    # use our local fetch offsets to avoid concurrency issues
+                    self._reset_partition_offset(resp.partition, offsets, fetch_offsets)
                     # Retry this partition
                     retry_partitions[resp.partition] = partitions[resp.partition]
                     continue
@@ -469,12 +465,12 @@ class SimpleConsumer(Consumer):
                     resp.messages.pop()
 
                 for message in resp.messages:
-                    if message.offset < self.fetch_offsets[partition]:
+                    if message.offset < fetch_offsets[partition]:
                         log.debug('Skipping message %s because its offset is less than the consumer offset',
                                   message)
                         continue
                     # Put the message in our queue
                     meta = META(partition, high_water_mark)
-                    self.queue.put((meta, message), block=True)
-                    self.fetch_offsets[partition] = message.offset + 1
+                    queue.put((meta, message), block=True)
+                    fetch_offsets[partition] = message.offset + 1
             partitions = retry_partitions
